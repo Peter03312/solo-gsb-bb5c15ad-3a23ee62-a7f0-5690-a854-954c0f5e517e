@@ -1,0 +1,15 @@
+services:
+  evidence-api:
+    build: .
+    image: evidence-seal-api:latest
+    container_name: evidence-seal-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - evidence-data:/data
+    environment:
+      EVIDENCE_DB: /data/evidence.db
+    restart: unless-stopped
+
+volumes:
+  evidence-data:

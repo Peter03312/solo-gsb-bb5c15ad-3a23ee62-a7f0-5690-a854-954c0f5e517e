@@ -1,0 +1,21 @@
+{
+  "source_id": "sensor-shanghai-01",
+  "batch_no": 3,
+  "prev_hash": "09e3c120d8013fc81ca12a6f1342b2b58d55f6917323b6edb509f70715d923af",
+  "events": [
+    {
+      "event_id": "evt-3-001",
+      "ts": "2026-09-23T03:00:00Z",
+      "metric": "temperature",
+      "value": 26.0,
+      "unit": "C"
+    },
+    {
+      "event_id": "evt-3-002",
+      "ts": "2026-09-23T03:05:00Z",
+      "metric": "humidity",
+      "value": 58,
+      "unit": "%"
+    }
+  ]
+}

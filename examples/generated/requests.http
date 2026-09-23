@@ -1,0 +1,61 @@
+### 健康检查
+GET http://localhost:8000/health
+
+### 创世锚点 sha256("")
+GET http://localhost:8000/api/v1/genesis
+
+### 乱序演示：先到 #3（暂存，产生缺口）
+POST http://localhost:8000/api/v1/batches
+Content-Type: application/json
+
+< ./batch-3.json
+
+### 重试 #3（幂等，HTTP 200, duplicate=true）
+POST http://localhost:8000/api/v1/batches
+Content-Type: application/json
+
+< ./batch-3.json
+
+### 冲突批次（同 batch_no 但内容不同 -> 409 duplicate_conflict）
+POST http://localhost:8000/api/v1/batches
+Content-Type: application/json
+
+< ./batch-3-conflict.json
+
+> {% client.test("expect 409", () => client.response.status === 409); %}
+
+### 查缺口（缺 1、2）
+GET http://localhost:8000/api/v1/sources/sensor-shanghai-01/gaps
+
+### 链未闭合时尝试封存（-> 409 chain_not_complete）
+POST http://localhost:8000/api/v1/seals
+Content-Type: application/json
+
+{"source_id": "sensor-shanghai-01"}
+
+### 补 #1、#2
+POST http://localhost:8000/api/v1/batches
+Content-Type: application/json
+
+< ./batch-1.json
+
+###
+POST http://localhost:8000/api/v1/batches
+Content-Type: application/json
+
+< ./batch-2.json
+
+### 链闭合，封存，返回确定性 Merkle 根
+POST http://localhost:8000/api/v1/seals
+Content-Type: application/json
+
+{"source_id": "sensor-shanghai-01"}
+
+### 取 #1 第 0 个事件的包含证明
+GET http://localhost:8000/api/v1/batches/sensor-shanghai-01/1/proof?event_index=0
+
+### 查封存状态
+GET http://localhost:8000/api/v1/sources/sensor-shanghai-01/seal
+
+### 全量来源视图
+GET http://localhost:8000/api/v1/sources
