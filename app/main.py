@@ -9,7 +9,13 @@ from fastapi.responses import JSONResponse
 from . import db, service
 from .errors import APIError
 from .hashing import GENESIS_HASH
-from .schemas import SealRequest, SubmitBatchRequest, VerifyRequest
+from .schemas import (
+    ActivateContractRequest,
+    RegisterContractRequest,
+    SealRequest,
+    SubmitBatchRequest,
+    VerifyRequest,
+)
 
 
 @asynccontextmanager
@@ -60,6 +66,53 @@ def genesis():
     return {"genesis_prev_hash": GENESIS_HASH}
 
 
+# ---------------------------------------------------------------- 契约
+
+@app.post("/api/v1/contracts", tags=["contracts"], status_code=201)
+def register_contract(req: RegisterContractRequest, response: Response, conn=Depends(get_conn)):
+    """注册某来源的一个不可变事件契约版本（受限 JSON Schema 子集）。
+
+    同一版本内容完全一致时幂等返回 ``200 + idempotent=true``；
+    同版本不同内容返回 ``409 contract_conflict``。
+    """
+    result = service.register_contract(
+        conn,
+        source_id=req.source_id,
+        version=req.version,
+        schema=req.schema_,
+    )
+    response.status_code = 200 if result.get("idempotent") else 201
+    return result
+
+
+@app.get("/api/v1/contracts", tags=["contracts"])
+def list_all_contracts(conn=Depends(get_conn)):
+    """列出所有已注册契约的来源、版本与当前生效版本。"""
+    return service.list_all_contracts(conn)
+
+
+@app.get("/api/v1/contracts/{source_id}", tags=["contracts"])
+def list_contracts(source_id: str, conn=Depends(get_conn)):
+    """列出某来源的全部契约版本与生效状态。"""
+    return service.list_contracts(conn, source_id)
+
+
+@app.get("/api/v1/contracts/{source_id}/{version}", tags=["contracts"])
+def get_contract(source_id: str, version: str, conn=Depends(get_conn)):
+    """获取某来源某个契约版本的完整 schema。"""
+    return service.get_contract_detail(conn, source_id, version)
+
+
+@app.put("/api/v1/contracts/{source_id}/activate", tags=["contracts"])
+def activate_contract(
+    source_id: str, req: ActivateContractRequest, conn=Depends(get_conn)
+):
+    """原子切换某来源当前生效的契约版本；重复激活同一版本幂等。"""
+    return service.activate_contract(
+        conn, source_id=source_id, version=req.version
+    )
+
+
 # ---------------------------------------------------------------- 提交
 
 @app.post("/api/v1/batches", tags=["batches"])
@@ -67,6 +120,8 @@ def submit_batch(req: SubmitBatchRequest, response: Response, conn=Depends(get_c
     """提交（或幂等重试）一个事件批次；允许乱序到达。
 
     新批次返回 201；内容完全一致的重复提交返回 200 且 ``duplicate=true``。
+    可选携带 ``contract_version``：必须为该来源当前生效版本，
+    服务端按契约逐事件校验，任一事件失败整批拒绝（422，details 中给出 JSONPath）。
     """
     result = service.submit_batch(
         conn,
@@ -74,6 +129,7 @@ def submit_batch(req: SubmitBatchRequest, response: Response, conn=Depends(get_c
         batch_no=req.batch_no,
         prev_hash=req.prev_hash,
         events=req.events,
+        contract_version=req.contract_version,
     )
     response.status_code = 200 if result.get("duplicate") else 201
     return result

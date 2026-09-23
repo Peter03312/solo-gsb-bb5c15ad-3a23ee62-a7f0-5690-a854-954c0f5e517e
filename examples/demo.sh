@@ -84,3 +84,52 @@ PY
 echo
 echo "演示完成。交互式请求见: $GEN/requests.http"
 echo "接口文档:   $BASE/docs"
+
+# ---------------------------------------------------------------- 契约演示
+CSID="sensor-contract-01"
+echo
+echo "==> [契约] 注册 v1（受限 JSON Schema 子集）"
+curl -fsS -X POST "$BASE/api/v1/contracts" -H 'Content-Type: application/json' -d '{
+  "source_id": "'"$CSID"'",
+  "version": "v1",
+  "schema": {
+    "type": "object",
+    "required": ["event_id", "level"],
+    "properties": {
+      "event_id": {"type": "string"},
+      "level": {"type": "string", "enum": ["info", "warn", "error"]}
+    }
+  }
+}' | python3 -m json.tool
+
+echo "==> [契约] 幂等重注册 v1（HTTP 200, idempotent=true）"
+curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' -X POST "$BASE/api/v1/contracts" \
+    -H 'Content-Type: application/json' -d '{
+      "source_id": "'"$CSID"'", "version": "v1",
+      "schema": {"properties": {"level": {"enum": ["error", "info", "warn"],
+        "type": "string"}, "event_id": {"type": "string"}},
+        "required": ["event_id", "level"], "type": "object"}}'
+
+echo "==> [契约] 激活 v1"
+curl -fsS -X PUT "$BASE/api/v1/contracts/$CSID/activate" \
+    -H 'Content-Type: application/json' -d '{"version":"v1"}' | python3 -m json.tool
+
+echo "==> [契约] 提交不合规批次（期望 422，返回逐事件 JSONPath，整批拒绝）"
+curl -sS -X POST "$BASE/api/v1/batches" -H 'Content-Type: application/json' -w '\nHTTP %{http_code}\n' -d '{
+  "source_id": "'"$CSID"'", "batch_no": 1,
+  "prev_hash": "'"$(curl -fsS "$BASE/api/v1/genesis" | python3 -c 'import sys,json;print(json.load(sys.stdin)["genesis_prev_hash"])')"'",
+  "contract_version": "v1",
+  "events": [{"event_id": 7, "level": "fatal"}]
+}'
+
+echo "==> [契约] 提交合规批次（201），随后查询契约列表"
+curl -fsS -o /dev/null -w 'HTTP %{http_code}\n' -X POST "$BASE/api/v1/batches" \
+    -H 'Content-Type: application/json' -d '{
+      "source_id": "'"$CSID"'", "batch_no": 1,
+      "prev_hash": "'"$(curl -fsS "$BASE/api/v1/genesis" | python3 -c 'import sys,json;print(json.load(sys.stdin)["genesis_prev_hash"])')"'",
+      "contract_version": "v1",
+      "events": [{"event_id": "evt-1", "level": "info"}]}'
+curl -fsS "$BASE/api/v1/contracts/$CSID" | python3 -m json.tool
+
+echo
+echo "契约演示完成。"

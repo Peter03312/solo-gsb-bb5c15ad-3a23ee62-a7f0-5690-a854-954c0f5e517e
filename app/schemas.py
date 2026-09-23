@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class SubmitBatchRequest(BaseModel):
@@ -14,6 +14,31 @@ class SubmitBatchRequest(BaseModel):
     batch_no: int = Field(..., ge=1, description="该来源下从 1 开始的单调递增批次号")
     prev_hash: str = Field(..., description="前一批次的 batch_hash；创世批次为 sha256('')")
     events: list[Any] = Field(..., min_length=1, description="本批证据事件（任意 JSON，非空）")
+    contract_version: Optional[str] = Field(
+        None,
+        min_length=1,
+        description=(
+            "按该来源当前生效的契约版本逐事件校验；"
+            "必须等于该来源已激活的版本，否则 404/409。省略则不做契约校验（向后兼容）"
+        ),
+    )
+
+
+class RegisterContractRequest(BaseModel):
+    # populate_by_name：FastAPI OpenAPI 仍能使用 schema 字段名
+    model_config = ConfigDict(populate_by_name=True)
+
+    source_id: str = Field(..., min_length=1, description="采集端 / 证据来源标识")
+    version: str = Field(..., min_length=1, description="该来源下不可变的契约版本号（任意非空字符串）")
+    schema_: dict[str, Any] = Field(
+        ...,
+        alias="schema",
+        description="受限 JSON Schema 子集，仅允许 type/required/properties/items/enum",
+    )
+
+
+class ActivateContractRequest(BaseModel):
+    version: str = Field(..., min_length=1, description="要原子切换为生效版本的契约版本号")
 
 
 class SealRequest(BaseModel):

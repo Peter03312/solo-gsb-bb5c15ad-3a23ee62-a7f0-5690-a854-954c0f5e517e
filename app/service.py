@@ -1,10 +1,11 @@
-"""业务服务层：提交暂存、缺口查询、链闭合封存、包含证明与校验。"""
+"""业务服务层：契约注册/激活、提交暂存、缺口查询、链闭合封存、包含证明与校验。"""
 from __future__ import annotations
 
 import json
 import sqlite3
 from typing import Any, Optional
 
+from . import contracts as contract_mod
 from . import db
 from .errors import ConflictError, NotFoundError, ValidationError
 from .hashing import (
@@ -32,6 +33,7 @@ def _row_to_batch_dict(row: sqlite3.Row) -> dict[str, Any]:
         "events_root": row["events_root"],
         "event_count": row["event_count"],
         "status": row["status"],
+        "contract_version": row["contract_version"],
         "created_at": row["created_at"],
         "sealed_at": row["sealed_at"],
     }
@@ -74,6 +76,7 @@ def submit_batch(
     batch_no: int,
     prev_hash: str,
     events: list[Any],
+    contract_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """提交一个批次（允许乱序、允许重试）。
 
@@ -81,6 +84,11 @@ def submit_batch(
     * 完全相同的重复提交（幂等重试） -> duplicate=True，不报错
     * 同序号但内容/prev_hash 不同    -> 409 Conflict
     * 与已存在前驱的 prev_hash 不匹配 -> 409 Conflict
+
+    当显式携带 contract_version 时：
+    * 版本未注册                -> 404 contract_not_found
+    * 版本非该来源当前生效版本  -> 409 contract_version_inactive
+    * 任一事件不符契约          -> 422 contract_violation（整批拒绝，不落库）
     """
     if batch_no < 1:
         raise ValidationError("batch_no 必须为 >= 1 的整数")
@@ -102,6 +110,22 @@ def submit_batch(
         existing = db.get_batch(conn, source_id, batch_no)
         if existing is not None:
             return _handle_duplicate(conn, existing, prev_hash, events, new_batch_hash)
+
+        # 契约解析与逐事件校验（仅对新批次；重复重试原样回显）
+        if contract_version is not None:
+            schema = _resolve_active_contract(conn, source_id, contract_version)
+            violations = contract_mod.validate_events(schema, events)
+            if violations:
+                raise ValidationError(
+                    f"批次中有 {len(violations)} 处不符合契约 "
+                    f"{source_id}@{contract_version}，整批拒绝",
+                    code="contract_violation",
+                    details={
+                        "source_id": source_id,
+                        "contract_version": contract_version,
+                        "violations": violations,
+                    },
+                )
 
         # 创世批次必须锚定 sha256("")
         if batch_no == 1 and prev_hash != GENESIS_HASH:
@@ -145,6 +169,7 @@ def submit_batch(
             batch_hash=new_batch_hash,
             events_root=root,
             events=events,
+            contract_version=contract_version,
         )
         conn.commit()
 
@@ -159,10 +184,38 @@ def submit_batch(
                 "events_root": root,
                 "event_count": len(events),
                 "status": "staged",
+                "contract_version": contract_version,
             },
             "next_expected_batch_no": next_expected,
         }
         return result
+
+
+def _resolve_active_contract(
+    conn: sqlite3.Connection, source_id: str, version: str
+) -> dict[str, Any]:
+    """确认 (source_id, version) 已注册且为当前生效版本，返回解析后的模式。"""
+    row = db.get_contract(conn, source_id, version)
+    if row is None:
+        raise NotFoundError(
+            f"来源 {source_id} 未注册契约版本 {version!r}，"
+            "请先 POST /api/v1/contracts 并激活",
+        )
+    # NotFoundError 默认 code=not_found，覆盖为更具体的错误码
+    active = db.get_active_contract(conn, source_id)
+    active_version = active["version"] if active else None
+    if active_version != version:
+        raise ConflictError(
+            f"契约版本 {version!r} 不是来源 {source_id} 当前生效版本"
+            f"（当前生效：{active_version!r}）",
+            code="contract_version_inactive",
+            details={
+                "source_id": source_id,
+                "requested_version": version,
+                "active_version": active_version,
+            },
+        )
+    return json.loads(row["schema_json"])
 
 
 def _handle_duplicate(
@@ -189,6 +242,164 @@ def _handle_duplicate(
         "batch": _row_to_batch_dict(existing),
         "next_expected_batch_no": _next_expected(conn, existing["source_id"]),
     }
+
+
+# ---------------------------------------------------------------- 契约
+
+def _row_to_contract_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {
+        "source_id": row["source_id"],
+        "version": row["version"],
+        "schema": json.loads(row["schema_json"]),
+        "schema_hash": row["schema_hash"],
+        "created_at": row["created_at"],
+    }
+
+
+def register_contract(
+    conn: sqlite3.Connection,
+    *,
+    source_id: str,
+    version: str,
+    schema: dict[str, Any],
+) -> dict[str, Any]:
+    """注册某来源的一个不可变契约版本。
+
+    * 模式结构不合法       -> 422 contract_schema_invalid（全部结构问题一次返回）
+    * 同版本内容相同       -> 幂等，200 + idempotent=true
+    * 同版本内容不同       -> 409 contract_conflict（版本不可变）
+    """
+    try:
+        contract_mod.validate_schema(schema)
+    except contract_mod.SchemaSyntaxError as exc:
+        raise ValidationError(
+            "契约 schema 不是受支持的 JSON Schema 子集",
+            code="contract_schema_invalid",
+            details={
+                "source_id": source_id,
+                "version": version,
+                "violations": exc.violations,
+            },
+        )
+
+    # 内容指纹：对规范化 JSON 取哈希，使“同一内容、不同写法”也判定为相同
+    schema_hash = sha256_hex(b"\x00SCHEMA" + canonical_json(schema))
+
+    with db.lock():
+        row = db.get_contract(conn, source_id, version)
+        if row is not None:
+            if row["schema_hash"] != schema_hash:
+                raise ConflictError(
+                    f"来源 {source_id} 的契约版本 {version!r} 已存在且内容不同："
+                    f"已存 schema_hash={row['schema_hash']}，"
+                    f"提交 schema_hash={schema_hash}；版本内容不可变，请注册新版本",
+                    code="contract_conflict",
+                    details={
+                        "source_id": source_id,
+                        "version": version,
+                        "existing_schema_hash": row["schema_hash"],
+                        "submitted_schema_hash": schema_hash,
+                    },
+                )
+            return {"idempotent": True, "contract": _row_to_contract_dict(row)}
+
+        db.insert_contract(
+            conn,
+            source_id=source_id,
+            version=version,
+            schema=schema,
+            schema_hash=schema_hash,
+        )
+        conn.commit()
+        row = db.get_contract(conn, source_id, version)
+        return {"idempotent": False, "contract": _row_to_contract_dict(row)}
+
+
+def activate_contract(
+    conn: sqlite3.Connection, *, source_id: str, version: str
+) -> dict[str, Any]:
+    """原子切换某来源当前生效的契约版本（重复激活同一版本为幂等）。"""
+    with db.lock():
+        row = db.get_contract(conn, source_id, version)
+        if row is None:
+            raise NotFoundError(
+                f"来源 {source_id} 未注册契约版本 {version!r}，无法激活"
+            )
+
+        active = db.get_active_contract(conn, source_id)
+        if active is not None and active["version"] == version:
+            return {
+                "idempotent": True,
+                "source_id": source_id,
+                "active_version": version,
+                "schema_hash": row["schema_hash"],
+                "activated_at": active["activated_at"],
+            }
+
+        when = db.utcnow()
+        db.set_active_contract(conn, source_id=source_id, version=version, when=when)
+        conn.commit()
+        return {
+            "idempotent": False,
+            "source_id": source_id,
+            "active_version": version,
+            "schema_hash": row["schema_hash"],
+            "activated_at": when,
+        }
+
+
+def get_contract_detail(
+    conn: sqlite3.Connection, source_id: str, version: str
+) -> dict[str, Any]:
+    with db.lock():
+        row = db.get_contract(conn, source_id, version)
+        if row is None:
+            raise NotFoundError(
+                f"来源 {source_id} 的契约版本 {version!r} 不存在"
+            )
+        active = db.get_active_contract(conn, source_id)
+        result = _row_to_contract_dict(row)
+        result["active"] = active is not None and active["version"] == version
+        return result
+
+
+def list_contracts(conn: sqlite3.Connection, source_id: str) -> dict[str, Any]:
+    with db.lock():
+        rows = db.list_contract_versions(conn, source_id)
+        if not rows:
+            raise NotFoundError(f"来源 {source_id} 尚未注册任何契约版本")
+        active = db.get_active_contract(conn, source_id)
+        active_version = active["version"] if active else None
+        return {
+            "source_id": source_id,
+            "active_version": active_version,
+            "versions": [
+                {
+                    "version": r["version"],
+                    "schema_hash": r["schema_hash"],
+                    "active": r["version"] == active_version,
+                    "created_at": r["created_at"],
+                }
+                for r in rows
+            ],
+        }
+
+
+def list_all_contracts(conn: sqlite3.Connection) -> dict[str, Any]:
+    with db.lock():
+        sources = []
+        for source_id in db.list_contract_sources(conn):
+            active = db.get_active_contract(conn, source_id)
+            sources.append(
+                {
+                    "source_id": source_id,
+                    "active_version": active["version"] if active else None,
+                    "versions": [
+                        r["version"] for r in db.list_contract_versions(conn, source_id)
+                    ],
+                }
+            )
+        return {"sources": sources}
 
 
 # ---------------------------------------------------------------- 缺口 / 状态
