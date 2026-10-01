@@ -5,7 +5,7 @@ import json
 import sqlite3
 from typing import Any, Optional
 
-from . import db
+from . import contracts, db
 from .errors import ConflictError, NotFoundError, ValidationError
 from .hashing import (
     GENESIS_HASH,
@@ -34,6 +34,7 @@ def _row_to_batch_dict(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "created_at": row["created_at"],
         "sealed_at": row["sealed_at"],
+        "contract_version": row["contract_version"],
     }
 
 
@@ -74,6 +75,7 @@ def submit_batch(
     batch_no: int,
     prev_hash: str,
     events: list[Any],
+    contract_version: Optional[str] = None,
 ) -> dict[str, Any]:
     """提交一个批次（允许乱序、允许重试）。
 
@@ -102,6 +104,15 @@ def submit_batch(
         existing = db.get_batch(conn, source_id, batch_no)
         if existing is not None:
             return _handle_duplicate(conn, existing, prev_hash, events, new_batch_hash)
+
+        # 契约校验先于链判断与入库：任一事件不符即整批拒绝，绝不产生半截批次
+        if contract_version is not None:
+            contracts.enforce(
+                conn,
+                source_id=source_id,
+                contract_version=contract_version,
+                events=events,
+            )
 
         # 创世批次必须锚定 sha256("")
         if batch_no == 1 and prev_hash != GENESIS_HASH:
@@ -145,6 +156,7 @@ def submit_batch(
             batch_hash=new_batch_hash,
             events_root=root,
             events=events,
+            contract_version=contract_version,
         )
         conn.commit()
 
@@ -159,6 +171,7 @@ def submit_batch(
                 "events_root": root,
                 "event_count": len(events),
                 "status": "staged",
+                "contract_version": contract_version,
             },
             "next_expected_batch_no": next_expected,
         }
@@ -209,6 +222,7 @@ def get_gaps(conn: sqlite3.Connection, source_id: str) -> dict[str, Any]:
             "staged_batch_nos": staged,
             "missing_batch_nos": missing,
             "chain_complete": next_expected > max(present) if present else False,
+            "active_contract_version": contracts.active_version(conn, source_id),
         }
 
 

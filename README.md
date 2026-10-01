@@ -7,7 +7,10 @@
 - **重试幂等**：同一 `(source_id, batch_no)` 内容完全一致时安全重试（返回 `200 + duplicate=true`）；
 - **冲突明确报错**：同序号不同内容、`prev_hash` 与前驱不符、补洞批次与已到后继声明不符，一律 `409` 并给出错误码与详情；
 - **闭合才封存**：只有哈希链从创世批次起连续闭合才能封存，封存生成**确定性双层 Merkle 根**；
-- **可校验证明**：封存后可为任一事件出具“事件 → 批次 → 封存根”的包含证明，并提供纯密码学复核接口。
+- **可校验证明**：封存后可为任一事件出具“事件 → 批次 → 封存根”的包含证明，并提供纯密码学复核接口；
+- **来源事件契约（可选）**：可为每个 `source_id` 注册版本化的 JSON Schema 子集契约、
+  原子切换生效版本；批次携带 `contract_version` 时逐事件校验，任一失败整批拒绝并返回
+  JSONPath 错误；不携带则完全按旧行为处理。
 
 仅依赖 **FastAPI + SQLite（标准库 sqlite3）**，数据落本地卷，**无需任何外部账号 / 外部服务**。
 
@@ -19,6 +22,7 @@
 app/
   main.py       # FastAPI 路由、生命周期、统一错误格式
   service.py    # 提交/缺口/封存/证明/校验 业务逻辑
+  contracts.py  # 来源事件契约：JSON Schema 子集注册/激活/逐事件校验（JSONPath）
   db.py         # SQLite 连接、建表、串行写锁
   hashing.py    # 规范化 JSON、SHA-256、Merkle 树/证明
   schemas.py    # 请求模型
@@ -27,7 +31,7 @@ examples/
   generate_examples.py  # 生成自洽链的示例批次（仅标准库）
   demo.sh               # curl 端到端演示
   generated/            # 运行生成器后出现（含 requests.http）
-tests/                  # pytest 端到端测试（14 项）
+tests/                  # pytest 端到端测试（37 项）
 Dockerfile
 docker-compose.yml
 ```
@@ -128,7 +132,13 @@ python -m pytest -q
 |---|---|---|
 | GET | `/health` | 健康检查 |
 | GET | `/api/v1/genesis` | 返回创世锚点 `sha256("")` |
-| POST | `/api/v1/batches` | 提交/重试一个批次（乱序允许） |
+| POST | `/api/v1/batches` | 提交/重试一个批次（乱序允许；可带 `contract_version`） |
+| POST | `/api/v1/contracts` | 注册来源事件契约版本（JSON Schema 子集，幂等） |
+| GET | `/api/v1/contracts` | 列出所有来源的契约版本与生效版本 |
+| GET | `/api/v1/contracts/{source_id}` | 查询某来源全部契约版本与生效标记 |
+| GET | `/api/v1/contracts/{source_id}/{version}` | 获取单个契约版本（含完整 schema） |
+| GET | `/api/v1/contracts/{source_id}/active` | 获取当前生效契约 |
+| PUT | `/api/v1/contracts/{source_id}/activate` | 原子切换生效契约版本 |
 | GET | `/api/v1/sources` | 所有来源的封存水位与缺口 |
 | GET | `/api/v1/sources/{source_id}/gaps` | 查询暂存缺口 |
 | GET | `/api/v1/sources/{source_id}/seal` | 查询封存状态与封存根 |
@@ -154,9 +164,105 @@ python -m pytest -q
 
 - 新批次：`201`；完全相同的重试：`200` 且响应 `duplicate=true`；
 - `events` 为非空数组，元素可为任意 JSON；
-- 成功响应含 `batch_hash`、`events_root` 与 `next_expected_batch_no`（下一个缺口序号）。
+- 成功响应含 `batch_hash`、`events_root` 与 `next_expected_batch_no`（下一个缺口序号）；
+- 可选 `contract_version`：见下方“来源事件契约”，省略时不做契约校验（向后兼容）。
 
-### 2) 查询缺口
+### 2) 来源事件契约
+
+契约是**按来源**版本化的事件 JSON Schema **子集**，只支持五个关键字：
+`type`、`required`、`properties`、`items`、`enum`；出现任何其它关键字会在注册时被
+`422 invalid_contract_schema` 拒绝（不会静默忽略校验语义）。
+
+`type` 支持 `object / array / string / number / integer / boolean / null`
+（`number` 接受整数与浮点数，`integer` 拒绝 `1.0`，布尔值不等于数字）。
+
+**注册版本** —— `POST /api/v1/contracts`
+
+```json
+{
+  "source_id": "sensor-shanghai-01",
+  "version": "v1",
+  "schema": {
+    "type": "object",
+    "required": ["event_id", "metric", "value"],
+    "properties": {
+      "event_id": {"type": "string"},
+      "metric": {"type": "string", "enum": ["temperature", "humidity"]},
+      "value": {"type": "number"},
+      "tags": {"type": "array", "items": {"type": "string"}}
+    }
+  }
+}
+```
+
+- 新版本返回 `201`；同一 `(source_id, version)` 提交**结构相同**的 schema
+  （键序无关，按规范化 JSON 计算 `content_hash`）返回 `200` 且 `idempotent=true`；
+- 同版本但 schema 内容不同 → `409 contract_conflict`，已存内容不会被覆盖。
+
+**激活 / 切换** —— `PUT /api/v1/contracts/{source_id}/activate`
+
+```json
+{"version": "v2"}
+```
+
+每个来源同时只有**一个生效版本**；指针是单行原子 upsert，切换对后续批次立即整体生效。
+重复激活当前版本返回 `idempotent=true`；激活未注册版本返回 `404`。
+
+**查询**
+
+| 路径 | 返回 |
+|---|---|
+| `GET /api/v1/contracts` | 所有来源、各自版本列表与 `active_version` |
+| `GET /api/v1/contracts/{source_id}` | 该来源全部版本（列表不含 schema 正文，带 `active` 标记） |
+| `GET /api/v1/contracts/{source_id}/{version}` | 单版本完整内容（含 schema 与 `content_hash`） |
+| `GET /api/v1/contracts/{source_id}/active` | 当前生效版本完整内容 |
+
+**带契约提交批次** —— 在 `POST /api/v1/batches` 中增加 `contract_version`：
+
+```json
+{
+  "source_id": "sensor-shanghai-01",
+  "batch_no": 1,
+  "prev_hash": "e3b0c442…b855",
+  "contract_version": "v1",
+  "events": [
+    {"event_id": "evt-001", "metric": "temperature", "value": 24.0, "tags": ["a"]}
+  ]
+}
+```
+
+- 版本未注册 → `404`；已注册但不是生效版本 → `409 contract_not_active`
+  （`details` 同时给出请求版本与当前生效版本）；
+- 服务端在入库前**逐事件**校验，任一事件不符即**整批拒绝**（批次不会暂存），
+  返回 `422 contract_violation`，`details.violations` 给出每处违规的
+  **JSONPath**（定位到事件下标与字段）、规则（`type/required/enum`）与实际类型：
+
+```json
+{
+  "error": {
+    "code": "contract_violation",
+    "message": "3 处事件不符合契约版本 'v1'，整批拒绝",
+    "details": {
+      "source_id": "sensor-shanghai-01",
+      "contract_version": "v1",
+      "violations": [
+        {"event_index": 0, "path": "$.events[0].value", "rule": "type",
+         "expected": "number", "actual": "string",
+         "message": "类型应为 number，实际为 string"},
+        {"event_index": 0, "path": "$.events[0].tags[1]", "rule": "type",
+         "expected": "string", "actual": "integer", "message": "…"}
+      ]
+    }
+  }
+}
+```
+
+- 校验通过后哈希链 / 封存 / 证明流程**完全不变**：契约不参与任何哈希计算，
+  成功响应与批次详情仅额外回显 `contract_version`；
+- 不带 `contract_version` 的批次、以及没有契约的来源，行为与旧版完全一致
+  （`/sources/.../gaps` 额外附带 `active_contract_version`，无契约时为 `null`）。
+
+### 3) 查询缺口
 
 `GET /api/v1/sources/sensor-shanghai-01/gaps`
 
@@ -171,7 +277,7 @@ python -m pytest -q
 }
 ```
 
-### 3) 封存
+### 4) 封存
 
 `POST /api/v1/seals`，body `{"source_id": "..."}` 封存整条已闭合的暂存链；
 也可 `{"source_id": "...", "to_batch_no": 2}` 只封存连续前缀（后续批次仍在暂存区）。
@@ -192,7 +298,7 @@ python -m pytest -q
 封存时会从库中重新逐批复算链指针与批次哈希；库内数据被篡改会得到
 `409 tampered_batch`。对同一水位重复封存返回 `idempotent=true` 的同一条记录。
 
-### 4) 取证明 / 校验
+### 5) 取证明 / 校验
 
 - `GET /api/v1/batches/{sid}/1/proof?event_index=0`
 - `POST /api/v1/verify`：把上一个响应的 `proof` 各字段原样回传（字段名见
@@ -222,8 +328,12 @@ python -m pytest -q
 | 409 | `tampered_batch` | 库内事件与其存储的 `batch_hash` 对不上 |
 | 409 | `not_sealed` | 未封存批次请求出具证明 |
 | 409 | `batch_sealed` | 试图改动已封存批次 |
-| 404 | `not_found` | 批次/资源不存在 |
+| 409 | `contract_conflict` | 同 `(source_id, version)` 重复注册但 schema 内容不同 |
+| 409 | `contract_not_active` | 批次声明的契约版本不是当前生效版本（`details.active_version`） |
+| 404 | `not_found` | 批次/资源/契约版本不存在，或来源尚无生效契约 |
 | 422 | `validation_error` / 请求校验 | 空事件、非法 `batch_no`、非法 `prev_hash` 等 |
+| 422 | `invalid_contract_schema` | 注册的 schema 含不支持关键字或结构不合法 |
+| 422 | `contract_violation` | 批次事件不符合契约（`details.violations` 含 JSONPath），整批拒绝 |
 
 ---
 

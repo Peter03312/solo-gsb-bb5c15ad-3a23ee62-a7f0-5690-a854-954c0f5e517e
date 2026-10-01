@@ -14,6 +14,36 @@ class SubmitBatchRequest(BaseModel):
     batch_no: int = Field(..., ge=1, description="该来源下从 1 开始的单调递增批次号")
     prev_hash: str = Field(..., description="前一批次的 batch_hash；创世批次为 sha256('')")
     events: list[Any] = Field(..., min_length=1, description="本批证据事件（任意 JSON，非空）")
+    contract_version: Optional[str] = Field(
+        None,
+        min_length=1,
+        description=(
+            "提交时声明遵循的契约版本；必须是该来源当前生效版本，"
+            "服务端按契约逐事件校验，任一失败整批拒绝。省略则不做契约校验（向后兼容）"
+        ),
+    )
+
+
+class RegisterContractRequest(BaseModel):
+    source_id: str = Field(..., min_length=1, description="采集端 / 证据来源标识")
+    version: str = Field(..., min_length=1, description="该来源下的契约版本标识（字符串）")
+    schema_: dict[str, Any] = Field(
+        ...,
+        alias="schema",
+        description=(
+            "JSON Schema 子集，仅支持关键字 type / required / properties / items / enum"
+        ),
+    )
+
+    model_config = {"populate_by_name": True}
+
+
+class ActivateContractRequest(BaseModel):
+    version: str = Field(
+        ...,
+        min_length=1,
+        description="要切换为生效版本的契约版本标识",
+    )
 
 
 class SealRequest(BaseModel):

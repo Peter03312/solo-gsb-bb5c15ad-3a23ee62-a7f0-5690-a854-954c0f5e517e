@@ -4,6 +4,8 @@
 
 * batches —— 每个 (source_id, batch_no) 一行，记录链式状态与暂存/封存状态
 * seals   —— 每个 source_id 一行，记录当前封存水位与封存 Merkle 根
+* contract_versions    —— 每个 (source_id, version) 一行，不可变的事件契约
+* contract_activations —— 每个 source_id 一行，指向当前生效契约版本（原子切换）
 
 写入均在进程级互斥锁 + 单写事务内完成，保证多采集端并发提交/封存时
 链状态判断的一致性。
@@ -40,6 +42,25 @@ CREATE TABLE IF NOT EXISTS seals (
     seal_root       TEXT NOT NULL,
     sealed_at       TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS contract_versions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_id       TEXT NOT NULL,
+    version         TEXT NOT NULL,
+    schema_json     TEXT NOT NULL,
+    content_hash    TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (source_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS contract_activations (
+    source_id       TEXT PRIMARY KEY,
+    version         TEXT NOT NULL,
+    activated_at    TEXT NOT NULL,
+    UNIQUE (source_id, version),
+    FOREIGN KEY (source_id, version)
+        REFERENCES contract_versions (source_id, version)
+);
 """
 
 _write_lock = threading.RLock()
@@ -69,6 +90,12 @@ def connect(db_path: Optional[str] = None) -> sqlite3.Connection:
 def init_db(conn: sqlite3.Connection) -> None:
     with _write_lock:
         conn.executescript(_SCHEMA)
+        # 旧库迁移：批次记录提交时声明的契约版本（无契约为 NULL）
+        existing_cols = {
+            r["name"] for r in conn.execute("PRAGMA table_info(batches)").fetchall()
+        }
+        if "contract_version" not in existing_cols:
+            conn.execute("ALTER TABLE batches ADD COLUMN contract_version TEXT")
         conn.commit()
 
 
@@ -112,13 +139,14 @@ def insert_batch(
     batch_hash: str,
     events_root: str,
     events: list[Any],
+    contract_version: Optional[str] = None,
 ) -> None:
     conn.execute(
         """
         INSERT INTO batches
             (source_id, batch_no, prev_hash, batch_hash, events_root,
-             events_json, event_count, status, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', ?)
+             events_json, event_count, status, created_at, contract_version)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'staged', ?, ?)
         """,
         (
             source_id,
@@ -129,6 +157,7 @@ def insert_batch(
             json.dumps(events, ensure_ascii=False, separators=(",", ":")),
             len(events),
             utcnow(),
+            contract_version,
         ),
     )
 
@@ -161,4 +190,88 @@ def upsert_seal(
             sealed_at = excluded.sealed_at
         """,
         (source_id, sealed_to, batch_tree_root, root, when),
+    )
+
+
+# ---------------------------------------------------------------- 契约
+
+def get_contract(
+    conn: sqlite3.Connection, source_id: str, version: str
+) -> Optional[sqlite3.Row]:
+    cur = conn.execute(
+        "SELECT * FROM contract_versions WHERE source_id = ? AND version = ?",
+        (source_id, version),
+    )
+    return cur.fetchone()
+
+
+def list_contracts(conn: sqlite3.Connection, source_id: str) -> list[sqlite3.Row]:
+    cur = conn.execute(
+        "SELECT * FROM contract_versions WHERE source_id = ? ORDER BY id",
+        (source_id,),
+    )
+    return cur.fetchall()
+
+
+def list_contract_sources(conn: sqlite3.Connection) -> list[str]:
+    cur = conn.execute(
+        "SELECT DISTINCT source_id FROM contract_versions ORDER BY source_id"
+    )
+    return [r["source_id"] for r in cur.fetchall()]
+
+
+def insert_contract(
+    conn: sqlite3.Connection,
+    *,
+    source_id: str,
+    version: str,
+    schema: dict[str, Any],
+    content_hash: str,
+) -> None:
+    conn.execute(
+        """
+        INSERT INTO contract_versions (source_id, version, schema_json,
+                                       content_hash, created_at)
+        VALUES (?, ?, ?, ?, ?)
+        """,
+        (
+            source_id,
+            version,
+            json.dumps(schema, ensure_ascii=False, separators=(",", ":")),
+            content_hash,
+            utcnow(),
+        ),
+    )
+
+
+def get_active_contract(
+    conn: sqlite3.Connection, source_id: str
+) -> Optional[sqlite3.Row]:
+    """返回当前生效契约（activations JOIN versions）；未激活/未知来源均为 None。"""
+    cur = conn.execute(
+        """
+        SELECT v.*, a.activated_at
+        FROM contract_activations AS a
+        JOIN contract_versions AS v
+          ON v.source_id = a.source_id AND v.version = a.version
+        WHERE a.source_id = ?
+        """,
+        (source_id,),
+    )
+    return cur.fetchone()
+
+
+def activate_contract(
+    conn: sqlite3.Connection, *, source_id: str, version: str, when: str
+) -> None:
+    """单行 upsert：同一写事务内原子切换生效版本。"""
+    conn.execute(
+        """
+        INSERT INTO contract_activations (source_id, version, activated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(source_id) DO UPDATE SET
+            version = excluded.version,
+            activated_at = excluded.activated_at
+        """,
+        (source_id, version, when),
     )

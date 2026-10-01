@@ -20,6 +20,7 @@ GENESIS_HASH = hashlib.sha256(b"").hexdigest()
 _LEAF_PREFIX = b"\x00EVT"
 _BATCH_PREFIX = b"\x00BATCH"
 _NODE_PREFIX = b"\x01NODE"
+_CONTRACT_PREFIX = b"\x00CONTRACT"
 
 
 def sha256_hex(data: bytes) -> str:
@@ -118,6 +119,21 @@ def batch_hash(source_id: str, batch_no: int, prev_hash: str, events: list[Any])
         "events_root": merkle_root(leaves),
     }
     return sha256_hex(_BATCH_PREFIX + canonical_json(payload))
+
+
+def contract_content_hash(
+    source_id: str, version: str, schema: dict[str, Any]
+) -> str:
+    """契约内容哈希：绑定来源与版本，对规范化后的 JSON Schema 子集哈希。
+
+    同版本同结构（键序无关）哈希一致，用于注册幂等与冲突判定。
+    """
+    payload = {
+        "source_id": source_id,
+        "version": version,
+        "schema": schema,
+    }
+    return sha256_hex(_CONTRACT_PREFIX + canonical_json(payload))
 
 
 def bind_seal_root(

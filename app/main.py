@@ -6,10 +6,16 @@ from contextlib import asynccontextmanager
 from fastapi import Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import db, service
+from . import contracts, db, service
 from .errors import APIError
 from .hashing import GENESIS_HASH
-from .schemas import SealRequest, SubmitBatchRequest, VerifyRequest
+from .schemas import (
+    ActivateContractRequest,
+    RegisterContractRequest,
+    SealRequest,
+    SubmitBatchRequest,
+    VerifyRequest,
+)
 
 
 @asynccontextmanager
@@ -74,9 +80,66 @@ def submit_batch(req: SubmitBatchRequest, response: Response, conn=Depends(get_c
         batch_no=req.batch_no,
         prev_hash=req.prev_hash,
         events=req.events,
+        contract_version=req.contract_version,
     )
     response.status_code = 200 if result.get("duplicate") else 201
     return result
+
+
+# ---------------------------------------------------------------- 来源事件契约
+
+@app.post("/api/v1/contracts", tags=["contracts"], status_code=201)
+def register_contract(req: RegisterContractRequest, response: Response, conn=Depends(get_conn)):
+    """注册某 source_id 的契约版本（JSON Schema 子集）。
+
+    同版本 schema 内容不变 -> 幂等回显（``idempotent=true``，HTTP 200）；
+    同版本 schema 冲突 -> 409 ``contract_conflict``。
+    """
+    result = contracts.register_contract(
+        conn,
+        source_id=req.source_id,
+        version=req.version,
+        schema=req.schema_,
+    )
+    response.status_code = 200 if result.get("idempotent") else 201
+    return result
+
+
+@app.get("/api/v1/contracts", tags=["contracts"])
+def list_contracts(conn=Depends(get_conn)):
+    """列出所有来源的契约版本与当前生效版本。"""
+    return contracts.list_all_contracts(conn)
+
+
+@app.get("/api/v1/contracts/{source_id}/active", tags=["contracts"])
+def get_active_contract(source_id: str, conn=Depends(get_conn)):
+    """查询某来源当前生效契约（含完整 schema）。"""
+    return contracts.get_active_contract_detail(conn, source_id)
+
+
+@app.put("/api/v1/contracts/{source_id}/activate", tags=["contracts"])
+def activate_contract(
+    source_id: str,
+    req: ActivateContractRequest,
+    conn=Depends(get_conn),
+):
+    """原子切换某来源的生效契约版本（请求体 ``{"version": "v2"}``）。
+
+    版本未注册 -> 404；重复激活当前版本 -> ``idempotent=true``。
+    """
+    return contracts.activate_contract(conn, source_id=source_id, version=req.version)
+
+
+@app.get("/api/v1/contracts/{source_id}", tags=["contracts"])
+def list_source_contracts(source_id: str, conn=Depends(get_conn)):
+    """查询某来源的全部契约版本与生效标记。"""
+    return contracts.list_contracts_for_source(conn, source_id)
+
+
+@app.get("/api/v1/contracts/{source_id}/{version}", tags=["contracts"])
+def get_contract(source_id: str, version: str, conn=Depends(get_conn)):
+    """获取单个契约版本（含完整 schema）。"""
+    return contracts.get_contract_detail(conn, source_id, version)
 
 
 # ---------------------------------------------------------------- 查询
